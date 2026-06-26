@@ -94,11 +94,15 @@ const loadFromLocalStorage = <T>(key: string): T | null => {
   }
 };
 
+// Load and log initial state
+const initialLedgerEntries = loadFromLocalStorage<LedgerEntry[]>(LOCAL_STORAGE_KEYS.ledgerEntries) || [];
+console.log('[Store] Initial ledgerEntries from localStorage:', initialLedgerEntries.length);
+
 export const useStore = create<StoreState>((set, get) => ({
   // State
   currentProject: loadFromLocalStorage<Project>(LOCAL_STORAGE_KEYS.project) || null,
   projects: [],
-  ledgerEntries: loadFromLocalStorage<LedgerEntry[]>(LOCAL_STORAGE_KEYS.ledgerEntries) || [],
+  ledgerEntries: initialLedgerEntries,
   ledgerMappings: [],
   ufsData: loadFromLocalStorage<UFSData[]>(LOCAL_STORAGE_KEYS.ufsData) || [],
   assumptions: loadFromLocalStorage<Assumption[]>(LOCAL_STORAGE_KEYS.assumptions) || [],
@@ -176,15 +180,19 @@ export const useStore = create<StoreState>((set, get) => ({
 
   addLedgerEntries: async (entries) => {
     console.log('[addLedgerEntries] Function entered');
+    console.log('[addLedgerEntries] Input entries:', entries.length);
+    console.log('[addLedgerEntries] Sample input:', entries[0]);
+
     const projectId = get().currentProject?.id;
     console.log('[addLedgerEntries] projectId:', projectId);
 
     const entriesWithIds: LedgerEntry[] = entries.map(e => ({
       ...e,
-      id: generateUUID(),
+      id: e.id || generateUUID(),
       project_id: projectId || 'local',
     }));
     console.log('[addLedgerEntries] Created', entriesWithIds.length, 'entries with IDs');
+    console.log('[addLedgerEntries] Sample with ID:', entriesWithIds[0]);
 
     // Try to save to Supabase only if project exists
     if (projectId) {
@@ -201,10 +209,14 @@ export const useStore = create<StoreState>((set, get) => ({
     }
 
     // Always save to local state and localStorage
-    console.log('[addLedgerEntries] Saving to local state...');
+    console.log('[addLedgerEntries] Current store entries:', get().ledgerEntries.length);
     const allEntries = [...get().ledgerEntries, ...entriesWithIds];
+    console.log('[addLedgerEntries] Setting store to', allEntries.length, 'entries');
     set({ ledgerEntries: allEntries });
     saveToLocalStorage(LOCAL_STORAGE_KEYS.ledgerEntries, allEntries);
+
+    // Verify
+    console.log('[addLedgerEntries] After set, store has:', get().ledgerEntries.length, 'entries');
     console.log('[addLedgerEntries] Function completed');
   },
 

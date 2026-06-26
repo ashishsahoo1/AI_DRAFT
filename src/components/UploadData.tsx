@@ -276,6 +276,15 @@ export function UploadData({ onComplete }: UploadDataProps) {
           amount: row.amount || (row.debit || 0) - (row.credit || 0),
         }));
 
+        console.log('[UploadData] Created LedgerEntry array:', entries.length, 'entries');
+        console.log('[UploadData] Sample entry:', entries[0]);
+
+        // IMPORTANT: Save entries to store immediately so AccountMapping has data
+        console.log('[UploadData] Calling addLedgerEntries immediately...');
+        await addLedgerEntries(entries);
+        console.log('[UploadData] addLedgerEntries completed');
+        console.log('[UploadData] Store ledgerEntries:', useStore.getState().ledgerEntries.length);
+
         console.log('[UploadData] Running mapping engine on', entries.length, 'entries');
         const savedRules = loadSavedRules();
         const { mapped, unmapped } = mapAllLedgers(entries, savedRules);
@@ -364,34 +373,18 @@ export function UploadData({ onComplete }: UploadDataProps) {
         console.log('[handleSubmit] Financial statements saved');
       }
 
-      // Save trial balance entries if present
-      if (parsedData.length > 0) {
-        console.log('[handleSubmit] Preparing ledger entries...');
-        updateStage('generating', 50);
-
-        const entries = parsedData.map((row) => ({
-          ledger_name: row.ledgerName,
-          debit_amount: row.debit || 0,
-          credit_amount: row.credit || 0,
-          amount: row.amount || (row.debit || 0) - (row.credit || 0),
+      // Ledger entries are already saved during file upload
+      // Just save mappings
+      updateStage('generating', 50);
+      if (mappedAccounts.length > 0) {
+        console.log('[handleSubmit] Saving mappings...');
+        const mappingData = mappedAccounts.map(m => ({
+          ledger_name: m.ledgerName,
+          ufs_account: m.ufsAccount,
+          ufs_category: m.ufsCategory,
+          is_manual: m.matchType === 'manual' || m.matchType === 'saved',
         }));
-
-        console.log('[handleSubmit] Calling addLedgerEntries with', entries.length, 'entries');
-        await addLedgerEntries(entries);
-        console.log('[handleSubmit] addLedgerEntries completed');
-
-        // Save mappings
-        updateStage('generating', 75);
-        if (mappedAccounts.length > 0) {
-          console.log('[handleSubmit] Saving mappings...');
-          const mappingData = mappedAccounts.map(m => ({
-            ledger_name: m.ledgerName,
-            ufs_account: m.ufsAccount,
-            ufs_category: m.ufsCategory,
-            is_manual: m.matchType === 'manual' || m.matchType === 'saved',
-          }));
-          await saveMappings(mappingData);
-        }
+        await saveMappings(mappingData);
       }
 
       updateStage('completed', 100);
@@ -1056,14 +1049,16 @@ export function UploadData({ onComplete }: UploadDataProps) {
       setUnmappedAccounts(unmapped);
 
       updateStage('generating', 80);
-      const ledgerEntries = sampleLedgerEntries.map((row) => ({
+      const sampleEntries = sampleLedgerEntries.map((row) => ({
         ledger_name: row.ledgerName,
         debit_amount: row.debit || 0,
         credit_amount: row.credit || 0,
         amount: row.amount || (row.debit || 0) - (row.credit || 0),
       }));
 
-      await addLedgerEntries(ledgerEntries);
+      console.log('[UploadData] Sample entries to save:', sampleEntries.length);
+      await addLedgerEntries(sampleEntries);
+      console.log('[UploadData] After addLedgerEntries, store has:', useStore.getState().ledgerEntries.length);
 
       updateStage('completed', 100);
       setCurrentStep('preview');

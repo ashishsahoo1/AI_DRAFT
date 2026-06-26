@@ -45,11 +45,16 @@ export async function parseExcelFile(file: File): Promise<ParseResult> {
 
 // Extended parser that returns financial statements
 export async function parseExcelFileExtended(file: File): Promise<ExtendedParseResult> {
+  console.log('[ExcelParser] Starting parse for file:', file.name);
   try {
     const financialData = await parseFinancialFile(file);
+    console.log('[ExcelParser] Financial data parsed:');
+    console.log('  - Statements:', financialData.statements.length);
+    console.log('  - Trial Balance rows:', financialData.trialBalance.length);
 
     // If financial statements found, return structured data
     if (financialData.statements.length > 0) {
+      console.log('[ExcelParser] Financial statements detected, returning structured data');
       const result: ExtendedParseResult = {
         data: financialData.trialBalance,
         errors: [],
@@ -64,6 +69,7 @@ export async function parseExcelFileExtended(file: File): Promise<ExtendedParseR
         result.errors = financialData.parseReport.warnings;
       }
 
+      console.log('[ExcelParser] Returning result with', result.data.length, 'parsed rows');
       return result;
     }
 

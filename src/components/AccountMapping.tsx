@@ -46,6 +46,10 @@ interface MappingRow {
 
 export function AccountMapping({ onComplete }: AccountMappingProps) {
   const { ledgerEntries, saveMappings, isLoading, setLoading, saveUFSData, currentProject } = useStore();
+
+  console.log('[AccountMapping] Component render');
+  console.log('[AccountMapping] ledgerEntries from hook:', ledgerEntries.length);
+
   const [mappings, setMappings] = useState<MappingRow[]>([]);
   const [filter, setFilter] = useState<'all' | 'mapped' | 'unmapped'>('unmapped');
   const [search, setSearch] = useState('');
@@ -60,7 +64,12 @@ export function AccountMapping({ onComplete }: AccountMappingProps) {
 
   // Initialize mappings from ledger entries
   useEffect(() => {
-    console.log('[AccountMapping] Initializing mappings for', ledgerEntries.length, 'entries');
+    console.log('[AccountMapping] Initializing mappings');
+    console.log('[AccountMapping] ledgerEntries from store:', ledgerEntries.length);
+    console.log('[AccountMapping] ledgerEntries sample:', ledgerEntries[0]);
+
+    const storeState = useStore.getState();
+    console.log('[AccountMapping] Direct store access:', storeState.ledgerEntries.length);
 
     const initialMappings: MappingRow[] = ledgerEntries.map(entry => {
       const result = mapLedgerToUFS(entry.ledger_name, savedRules);
@@ -75,6 +84,7 @@ export function AccountMapping({ onComplete }: AccountMappingProps) {
       };
     });
 
+    console.log('[AccountMapping] Created', initialMappings.length, 'mapping rows');
     setMappings(initialMappings);
   }, [ledgerEntries, savedRules]);
 
