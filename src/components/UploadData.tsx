@@ -1,6 +1,7 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { useStore } from '../store';
 import { parseExcelFileExtended, ExtendedParseResult } from '../lib/excel';
+import { mapAllLedgers, MappingResult, loadSavedRules, saveManualMapping } from '../lib/mappingEngine';
 import {
   ParsedRow,
   FinancialStatement,
@@ -8,6 +9,8 @@ import {
   UploadType,
   UploadWizardStep,
   UPLOAD_TYPES,
+  LedgerEntry,
+  UFSCategory,
 } from '../types';
 import {
   Upload,
@@ -30,10 +33,34 @@ import {
   File,
   ChevronLeft,
   Check,
+  Loader2,
+  ChevronDown,
+  Search,
+  Download,
+  Upload as UploadIcon,
+  RefreshCw,
+  X,
 } from 'lucide-react';
 
 interface UploadDataProps {
   onComplete: () => void;
+}
+
+type ProcessingStage =
+  | 'idle'
+  | 'uploading'
+  | 'reading'
+  | 'validating'
+  | 'mapping'
+  | 'generating'
+  | 'completed'
+  | 'error';
+
+interface ProcessingState {
+  stage: ProcessingStage;
+  stageLabel: string;
+  progress: number;
+  error?: string;
 }
 
 // Icon mapping for upload types
@@ -48,6 +75,20 @@ const TYPE_ICONS: Record<string, React.FC<{ className?: string }>> = {
   file: File,
 };
 
+// Processing stage labels
+const STAGE_LABELS: Record<ProcessingStage, string> = {
+  idle: 'Ready',
+  uploading: 'Uploading File',
+  reading: 'Reading Data',
+  validating: 'Validating Input',
+  mapping: 'Mapping Accounts',
+  generating: 'Generating Statements',
+  completed: 'Completed',
+  error: 'Error',
+};
+
+const PROCESSING_TIMEOUT = 60000; // 60 seconds max
+
 export function UploadData({ onComplete }: UploadDataProps) {
   const {
     addLedgerEntries,
@@ -57,6 +98,9 @@ export function UploadData({ onComplete }: UploadDataProps) {
     saveFinancialStatements,
     setFinancialStatements,
     setParseReport,
+    saveMappings,
+    saveUFSData,
+    currentProject,
     isLoading,
     setLoading,
     error,
@@ -70,6 +114,20 @@ export function UploadData({ onComplete }: UploadDataProps) {
   const [parsedData, setParsedData] = useState<ParsedRow[]>([]);
   const [extendedResult, setExtendedResult] = useState<ExtendedParseResult | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingState, setProcessingState] = useState<ProcessingState>({
+    stage: 'idle',
+    stageLabel: STAGE_LABELS.idle,
+    progress: 0,
+  });
+
+  // Mapping state
+  const [mappedAccounts, setMappedAccounts] = useState<MappingResult[]>([]);
+  const [unmappedAccounts, setUnmappedAccounts] = useState<MappingResult[]>([]);
+  const [mappingSearch, setMappingSearch] = useState('');
+
+  // Timeout ref
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Get selected upload type definition
   const selectedTypeDef = UPLOAD_TYPES.find((t) => t.id === selectedType);
@@ -79,10 +137,31 @@ export function UploadData({ onComplete }: UploadDataProps) {
     { id: 'select_type', title: 'Select Type' },
     { id: 'upload_file', title: 'Upload File' },
     { id: 'preview', title: 'Preview' },
+    { id: 'mapping', title: 'Mapping' },
     { id: 'complete', title: 'Complete' },
   ];
 
   const currentStepIndex = STEPS.findIndex((s) => s.id === currentStep);
+
+  // Clear timeout on unmount
+  React.useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Update processing state helper
+  const updateStage = (stage: ProcessingStage, progress = 0, errorMsg?: string) => {
+    console.log(`[UploadData] Stage: ${stage}, Progress: ${progress}%`);
+    setProcessingState({
+      stage,
+      stageLabel: STAGE_LABELS[stage],
+      progress,
+      error: errorMsg,
+    });
+  };
 
   // Handlers
   const handleSelectType = (type: UploadType) => {
@@ -92,6 +171,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
     setFile(null);
     setParsedData([]);
     setExtendedResult(null);
+    setMappedAccounts([]);
+    setUnmappedAccounts([]);
   };
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -117,66 +198,168 @@ export function UploadData({ onComplete }: UploadDataProps) {
   );
 
   const handleFileSelect = async (selectedFile: File) => {
+    console.log('[UploadData] File selected:', selectedFile.name);
+
+    // Clear any previous timeout
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+    }
+
+    // Set timeout
+    timeoutRef.current = setTimeout(() => {
+      console.error('[UploadData] Processing timeout');
+      updateStage('error', 0, 'Processing timed out. Please try again.');
+      setIsProcessing(false);
+      setLoading(false);
+    }, PROCESSING_TIMEOUT);
+
     // Validate file format
     if (selectedTypeDef) {
       const ext = '.' + selectedFile.name.split('.').pop()?.toLowerCase();
       if (!selectedTypeDef.supportedFormats.includes(ext)) {
         setError(`Invalid file format. Supported: ${selectedTypeDef.supportedFormats.join(', ')}`);
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
         return;
       }
     }
 
     setFile(selectedFile);
-    setLoading(true);
+    setIsProcessing(true);
     setError(null);
 
     try {
+      // Stage 1: Uploading
+      updateStage('uploading', 10);
+
+      // Stage 2: Reading
+      updateStage('reading', 25);
+      console.log('[UploadData] Parsing file...');
+
       const result = await parseExcelFileExtended(selectedFile);
+      console.log('[UploadData] Parse result:', {
+        dataRows: result.data.length,
+        statements: result.statements?.length || 0,
+        errors: result.errors.length,
+      });
+
+      // Stage 3: Validating
+      updateStage('validating', 40);
+
+      if (result.errors.length > 0) {
+        console.warn('[UploadData] Parse errors:', result.errors);
+      }
+
       setParsedData(result.data);
       setExtendedResult(result);
 
       // Store financial statements in the store if found
       if (result.statements && result.statements.length > 0) {
+        console.log('[UploadData] Setting financial statements:', result.statements.length);
         setFinancialStatements(result.statements);
       }
 
       if (result.parseReport) {
+        console.log('[UploadData] Setting parse report');
         setParseReport(result.parseReport);
       }
+
+      // Stage 4: Mapping (for trial balance or ledger data)
+      if (result.data.length > 0) {
+        updateStage('mapping', 60);
+
+        const entries: LedgerEntry[] = result.data.map((row) => ({
+          id: crypto.randomUUID(),
+          project_id: currentProject?.id || 'local',
+          ledger_name: row.ledgerName,
+          debit_amount: row.debit || 0,
+          credit_amount: row.credit || 0,
+          amount: row.amount || (row.debit || 0) - (row.credit || 0),
+        }));
+
+        console.log('[UploadData] Running mapping engine on', entries.length, 'entries');
+        const savedRules = loadSavedRules();
+        const { mapped, unmapped } = mapAllLedgers(entries, savedRules);
+
+        setMappedAccounts(mapped);
+        setUnmappedAccounts(unmapped);
+        console.log('[UploadData] Mapping complete:', mapped.length, 'mapped,', unmapped.length, 'unmapped');
+      }
+
+      // Stage 5: Complete
+      updateStage('generating', 80);
 
       if (result.errors.length > 0) {
         setError(result.errors.join(', '));
       }
 
-      // Move to preview step
+      // Clear timeout on success
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+
+      updateStage('completed', 100);
       setCurrentStep('preview');
+
     } catch (err) {
-      setError((err as Error).message);
-      setParsedData([]);
-      setExtendedResult(null);
+      console.error('[UploadData] File processing error:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error processing file';
+      setError(errorMessage);
+      updateStage('error', 0, errorMessage);
     } finally {
+      setIsProcessing(false);
       setLoading(false);
     }
   };
 
-  const handleSubmit = async () => {
-    console.log('[handleSubmit] Button clicked');
-    console.log('[handleSubmit] parsedData.length:', parsedData.length);
-    console.log('[handleSubmit] extendedResult?.statements?.length:', extendedResult?.statements?.length);
+  // Handle manual mapping for unmapped accounts
+  const handleManualMap = (ledgerName: string, ufsAccount: string, ufsCategory: UFSCategory) => {
+    console.log('[UploadData] Manual mapping:', ledgerName, '->', ufsAccount);
 
-    if (parsedData.length === 0 && (!extendedResult?.statements || extendedResult.statements.length === 0)) {
-      console.log('[handleSubmit] Validation failed - no data to import');
+    // Save as rule for future use
+    saveManualMapping(ledgerName, ufsAccount, ufsCategory, 'exact');
+
+    // Update local state
+    const newMapping: MappingResult = {
+      ledgerName,
+      ufsAccount,
+      ufsCategory,
+      confidence: 100,
+      matchType: 'manual',
+    };
+
+    setUnmappedAccounts(prev => prev.filter(m => m.ledgerName !== ledgerName));
+    setMappedAccounts(prev => [...prev, newMapping]);
+  };
+
+  // Handle import submission
+  const handleSubmit = async () => {
+    console.log('[handleSubmit] Starting import...');
+
+    // Check for unmapped accounts
+    if (unmappedAccounts.length > 0) {
+      console.log('[handleSubmit] Unmapped accounts exist, showing mapping step');
+      setCurrentStep('mapping');
       return;
     }
-    console.log('[handleSubmit] Validation passed');
 
+    console.log('[handleSubmit] All accounts mapped, proceeding with import');
+
+    if (parsedData.length === 0 && (!extendedResult?.statements || extendedResult.statements.length === 0)) {
+      console.log('[handleSubmit] No data to import');
+      setError('No data to import');
+      return;
+    }
+
+    setIsProcessing(true);
     setLoading(true);
-    console.log('[handleSubmit] Loading set to true');
+    updateStage('generating', 0);
 
     try {
       // Save financial statements if present
       if (extendedResult?.statements && extendedResult.statements.length > 0 && extendedResult.parseReport) {
         console.log('[handleSubmit] Saving financial statements...');
+        updateStage('generating', 25);
         await saveFinancialStatements(extendedResult.statements, extendedResult.parseReport);
         console.log('[handleSubmit] Financial statements saved');
       }
@@ -184,6 +367,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
       // Save trial balance entries if present
       if (parsedData.length > 0) {
         console.log('[handleSubmit] Preparing ledger entries...');
+        updateStage('generating', 50);
+
         const entries = parsedData.map((row) => ({
           ledger_name: row.ledgerName,
           debit_amount: row.debit || 0,
@@ -194,17 +379,33 @@ export function UploadData({ onComplete }: UploadDataProps) {
         console.log('[handleSubmit] Calling addLedgerEntries with', entries.length, 'entries');
         await addLedgerEntries(entries);
         console.log('[handleSubmit] addLedgerEntries completed');
+
+        // Save mappings
+        updateStage('generating', 75);
+        if (mappedAccounts.length > 0) {
+          console.log('[handleSubmit] Saving mappings...');
+          const mappingData = mappedAccounts.map(m => ({
+            ledger_name: m.ledgerName,
+            ufs_account: m.ufsAccount,
+            ufs_category: m.ufsCategory,
+            is_manual: m.matchType === 'manual' || m.matchType === 'saved',
+          }));
+          await saveMappings(mappingData);
+        }
       }
 
-      console.log('[handleSubmit] Current step before update:', currentStep);
+      updateStage('completed', 100);
+      console.log('[handleSubmit] Import complete');
       setCurrentStep('complete');
-      console.log('[handleSubmit] Current step after update: complete');
+
     } catch (err) {
       console.error('[handleSubmit] Error:', err);
-      setError((err as Error).message);
+      const errorMessage = err instanceof Error ? err.message : 'Import failed';
+      setError(errorMessage);
+      updateStage('error', 0, errorMessage);
     } finally {
+      setIsProcessing(false);
       setLoading(false);
-      console.log('[handleSubmit] Loading set to false');
     }
   };
 
@@ -219,6 +420,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
       setFile(null);
       setParsedData([]);
       setExtendedResult(null);
+    } else if (currentStep === 'mapping') {
+      setCurrentStep('preview');
     }
   };
 
@@ -228,6 +431,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
     setFile(null);
     setParsedData([]);
     setExtendedResult(null);
+    setMappedAccounts([]);
+    setUnmappedAccounts([]);
   };
 
   const handleStartOver = () => {
@@ -236,12 +441,22 @@ export function UploadData({ onComplete }: UploadDataProps) {
     setParsedData([]);
     setExtendedResult(null);
     setCurrentStep('select_type');
+    setMappedAccounts([]);
+    setUnmappedAccounts([]);
+    updateStage('idle', 0);
   };
 
   // Calculate totals for preview
   const totalDebit = parsedData.reduce((sum, row) => sum + (row.debit || 0), 0);
   const totalCredit = parsedData.reduce((sum, row) => sum + (row.credit || 0), 0);
   const isBalanced = Math.abs(totalDebit - totalCredit) < 0.01;
+
+  // Filter unmapped accounts by search
+  const filteredUnmapped = mappingSearch
+    ? unmappedAccounts.filter(m =>
+        m.ledgerName.toLowerCase().includes(mappingSearch.toLowerCase())
+      )
+    : unmappedAccounts;
 
   // Render step content
   const renderStepContent = () => {
@@ -252,6 +467,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
         return renderUploadFile();
       case 'preview':
         return renderPreview();
+      case 'mapping':
+        return renderMapping();
       case 'complete':
         return renderComplete();
       default:
@@ -300,7 +517,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
             <button
               key={type.id}
               onClick={() => handleSelectType(type.id)}
-              className="group p-6 bg-white border-2 border-slate-200 rounded-xl hover:border-blue-500 hover:shadow-lg transition-all text-left"
+              disabled={isProcessing}
+              className="group p-6 bg-white border-2 border-slate-200 rounded-xl hover:border-blue-500 hover:shadow-lg transition-all text-left disabled:opacity-50"
             >
               <div className="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center mb-4 group-hover:bg-blue-100 transition-colors">
                 <Icon className="w-6 h-6 text-blue-600" />
@@ -327,10 +545,10 @@ export function UploadData({ onComplete }: UploadDataProps) {
           </div>
           <button
             onClick={handleUseSampleData}
-            disabled={isLoading}
+            disabled={isProcessing || isLoading}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium disabled:opacity-50"
           >
-            {isLoading ? 'Loading...' : 'Use Sample Data'}
+            {isProcessing || isLoading ? 'Loading...' : 'Use Sample Data'}
           </button>
         </div>
       )}
@@ -347,6 +565,22 @@ export function UploadData({ onComplete }: UploadDataProps) {
         </p>
       </div>
 
+      {/* Processing indicator */}
+      {isProcessing && (
+        <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-xl">
+          <div className="flex items-center gap-3 mb-3">
+            <Loader2 className="w-5 h-5 text-blue-600 animate-spin" />
+            <span className="font-medium text-blue-900">{processingState.stageLabel}</span>
+          </div>
+          <div className="w-full bg-blue-200 rounded-full h-2">
+            <div
+              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+              style={{ width: `${processingState.progress}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Upload area */}
       <div
         onDragOver={handleDragOver}
@@ -356,13 +590,14 @@ export function UploadData({ onComplete }: UploadDataProps) {
           isDragging
             ? 'border-blue-500 bg-blue-50'
             : 'border-slate-300 hover:border-blue-400 hover:bg-slate-50'
-        }`}
+        } ${isProcessing ? 'opacity-50 pointer-events-none' : ''}`}
       >
         <input
           type="file"
           accept={selectedTypeDef?.supportedFormats.join(',')}
           onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
           className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+          disabled={isProcessing}
         />
         <div className="flex flex-col items-center">
           <div
@@ -418,6 +653,37 @@ export function UploadData({ onComplete }: UploadDataProps) {
         </div>
       )}
 
+      {/* Mapping Summary */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+          <p className="text-sm text-emerald-700">Mapped Accounts</p>
+          <p className="text-2xl font-bold text-emerald-900">{mappedAccounts.length}</p>
+        </div>
+        <div className={`border rounded-xl p-4 ${unmappedAccounts.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-emerald-50 border-emerald-200'}`}>
+          <p className={`text-sm ${unmappedAccounts.length > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>Unmapped Accounts</p>
+          <p className={`text-2xl font-bold ${unmappedAccounts.length > 0 ? 'text-amber-900' : 'text-emerald-900'}`}>{unmappedAccounts.length}</p>
+        </div>
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+          <p className="text-sm text-blue-700">Total Ledger Entries</p>
+          <p className="text-2xl font-bold text-blue-900">{parsedData.length}</p>
+        </div>
+      </div>
+
+      {/* Warning for unmapped accounts */}
+      {unmappedAccounts.length > 0 && (
+        <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="font-medium text-amber-900">Unmapped accounts detected</p>
+              <p className="text-sm text-amber-700">
+                {unmappedAccounts.length} accounts need manual mapping before generating reports.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Parser Validation Report */}
       {extendedResult?.parseReport && renderValidationReport(extendedResult.parseReport)}
 
@@ -439,7 +705,119 @@ export function UploadData({ onComplete }: UploadDataProps) {
     </div>
   );
 
-  // Step 4: Complete
+  // Step 4: Account Mapping
+  const renderMapping = () => {
+    const { UFS_ACCOUNTS } = require('../constants/ufs');
+
+    return (
+      <div className="space-y-6">
+        <div className="text-center mb-8">
+          <h2 className="text-2xl font-bold text-slate-900">Map Accounts</h2>
+          <p className="text-slate-600 mt-2">
+            {unmappedAccounts.length} accounts need manual mapping
+          </p>
+        </div>
+
+        {/* Search */}
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+          <input
+            type="text"
+            placeholder="Search accounts..."
+            value={mappingSearch}
+            onChange={(e) => setMappingSearch(e.target.value)}
+            className="w-full pl-10 pr-4 py-2 border border-slate-200 rounded-lg focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none"
+          />
+        </div>
+
+        {/* Unmapped accounts list */}
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="max-h-[400px] overflow-y-auto">
+            {filteredUnmapped.length === 0 ? (
+              <div className="p-8 text-center text-slate-500">
+                {mappingSearch ? 'No matching accounts found' : 'All accounts are mapped!'}
+              </div>
+            ) : (
+              filteredUnmapped.map((mapping, idx) => {
+                const entry = parsedData.find(p => p.ledgerName === mapping.ledgerName);
+                const amount = entry?.amount || (entry?.debit || 0) - (entry?.credit || 0);
+
+                return (
+                  <div key={idx} className="p-4 border-b border-slate-100 last:border-b-0">
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <p className="font-medium text-slate-900">{mapping.ledgerName}</p>
+                        <p className="text-sm text-slate-500">
+                          {amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {mapping.confidence > 0 && (
+                          <span className="text-sm text-slate-400">({mapping.confidence}%)</span>
+                        )}
+                      </div>
+                    </div>
+                    <select
+                      onChange={(e) => {
+                        const [account, category] = e.target.value.split('|');
+                        if (account && category) {
+                          handleManualMap(mapping.ledgerName, account, category as UFSCategory);
+                        }
+                      }}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 outline-none"
+                      defaultValue=""
+                    >
+                      <option value="">Select mapping...</option>
+                      <optgroup label="P&L">
+                        {UFS_ACCOUNTS.filter((u: any) => u.category === 'P&L').map((u: any) => (
+                          <option key={u.account} value={`${u.account}|${u.category}`}>
+                            {u.account}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Assets">
+                        {UFS_ACCOUNTS.filter((u: any) => u.category === 'Asset').map((u: any) => (
+                          <option key={u.account} value={`${u.account}|${u.category}`}>
+                            {u.account}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Liabilities">
+                        {UFS_ACCOUNTS.filter((u: any) => u.category === 'Liability').map((u: any) => (
+                          <option key={u.account} value={`${u.account}|${u.category}`}>
+                            {u.account}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Equity">
+                        {UFS_ACCOUNTS.filter((u: any) => u.category === 'Equity').map((u: any) => (
+                          <option key={u.account} value={`${u.account}|${u.category}`}>
+                            {u.account}
+                          </option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {error && (
+          <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="font-medium text-red-900">Error</p>
+              <p className="text-sm text-red-700">{error}</p>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Step 5: Complete
   const renderComplete = () => (
     <div className="text-center py-12">
       <div className="w-20 h-20 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-6">
@@ -449,12 +827,20 @@ export function UploadData({ onComplete }: UploadDataProps) {
       <p className="text-slate-600 mb-6">
         Successfully imported {extendedResult?.statements?.length || 0} statements and {parsedData.length} ledger entries
       </p>
-      <button
-        onClick={onComplete}
-        className="px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition-colors"
-      >
-        Continue to Account Mapping
-      </button>
+      <div className="flex justify-center gap-4">
+        <button
+          onClick={handleStartOver}
+          className="px-4 py-2 text-slate-600 hover:text-slate-900 transition-colors"
+        >
+          Import More Data
+        </button>
+        <button
+          onClick={onComplete}
+          className="px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition-colors"
+        >
+          Continue to Dashboard
+        </button>
+      </div>
     </div>
   );
 
@@ -617,8 +1003,11 @@ export function UploadData({ onComplete }: UploadDataProps) {
   const handleUseSampleData = async () => {
     setLoading(true);
     setError(null);
+    setIsProcessing(true);
 
     try {
+      updateStage('reading', 20);
+
       const sampleLedgerEntries: ParsedRow[] = [
         { ledgerName: 'Sales Revenue', credit: 50000000 },
         { ledgerName: 'Other Income', credit: 2500000 },
@@ -650,20 +1039,42 @@ export function UploadData({ onComplete }: UploadDataProps) {
 
       setParsedData(sampleLedgerEntries);
       setSelectedType('trial_balance');
-      setCurrentStep('preview');
 
-      const entries = sampleLedgerEntries.map((row) => ({
+      updateStage('mapping', 50);
+      const entries: LedgerEntry[] = sampleLedgerEntries.map((row) => ({
+        id: crypto.randomUUID(),
+        project_id: currentProject?.id || 'local',
         ledger_name: row.ledgerName,
         debit_amount: row.debit || 0,
         credit_amount: row.credit || 0,
         amount: row.amount || (row.debit || 0) - (row.credit || 0),
       }));
 
-      await addLedgerEntries(entries);
+      const savedRules = loadSavedRules();
+      const { mapped, unmapped } = mapAllLedgers(entries, savedRules);
+      setMappedAccounts(mapped);
+      setUnmappedAccounts(unmapped);
+
+      updateStage('generating', 80);
+      const ledgerEntries = sampleLedgerEntries.map((row) => ({
+        ledger_name: row.ledgerName,
+        debit_amount: row.debit || 0,
+        credit_amount: row.credit || 0,
+        amount: row.amount || (row.debit || 0) - (row.credit || 0),
+      }));
+
+      await addLedgerEntries(ledgerEntries);
+
+      updateStage('completed', 100);
+      setCurrentStep('preview');
+
     } catch (err) {
+      console.error('[UploadData] Sample data error:', err);
       setError((err as Error).message);
+      updateStage('error', 0, (err as Error).message);
     } finally {
       setLoading(false);
+      setIsProcessing(false);
     }
   };
 
@@ -731,7 +1142,7 @@ export function UploadData({ onComplete }: UploadDataProps) {
         <div className="mt-6 flex justify-between">
           <button
             onClick={handleBack}
-            disabled={isLoading}
+            disabled={isProcessing || isLoading}
             className="flex items-center gap-2 px-4 py-2 text-slate-600 hover:text-slate-900 transition-colors disabled:opacity-50"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -741,20 +1152,42 @@ export function UploadData({ onComplete }: UploadDataProps) {
           {currentStep === 'preview' && (
             <button
               onClick={handleSubmit}
-              disabled={isLoading || (parsedData.length === 0 && (!extendedResult?.statements || extendedResult.statements.length === 0))}
+              disabled={isProcessing || isLoading || (parsedData.length === 0 && (!extendedResult?.statements || extendedResult.statements.length === 0))}
               className="flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/30 disabled:opacity-50"
             >
-              {isLoading ? (
+              {isProcessing || isLoading ? (
                 <>
-                  <svg className="animate-spin w-5 h-5" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
+                  <Loader2 className="w-5 h-5 animate-spin" />
                   Processing...
+                </>
+              ) : unmappedAccounts.length > 0 ? (
+                <>
+                  Map Accounts ({unmappedAccounts.length})
+                  <ArrowRight className="w-4 h-4" />
                 </>
               ) : (
                 <>
                   Import Data
+                  <ArrowRight className="w-4 h-4" />
+                </>
+              )}
+            </button>
+          )}
+
+          {currentStep === 'mapping' && (
+            <button
+              onClick={handleSubmit}
+              disabled={isProcessing || isLoading || unmappedAccounts.length > 0}
+              className="flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition-all shadow-lg shadow-blue-500/30 disabled:opacity-50"
+            >
+              {isProcessing || isLoading ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Processing...
+                </>
+              ) : (
+                <>
+                  Complete Import
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}

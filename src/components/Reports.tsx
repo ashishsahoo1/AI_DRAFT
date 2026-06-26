@@ -3,6 +3,7 @@ import { useStore } from '../store';
 import { formatCurrency, formatIndianNumber } from '../lib/utils';
 import { createFinancialModelExport, exportToExcel } from '../lib/excel';
 import { ReportView, Scenario } from '../types';
+import { loadSavedRules, mapLedgerToUFS } from '../lib/mappingEngine';
 import {
   FileText,
   BarChart3,
@@ -11,25 +12,60 @@ import {
   Table,
   ChevronRight,
   AlertCircle,
+  AlertTriangle,
+  Settings2,
 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 interface ReportsProps {}
 
 export function Reports({}: ReportsProps) {
+  const navigate = useNavigate();
   const {
     currentProject,
     ufsData,
     forecasts,
     assumptions,
+    ledgerEntries,
+    ledgerMappings,
     activeScenario,
     setActiveScenario,
     loadUFSData,
     loadForecasts,
   } = useStore();
 
+  const [unmappedCount, setUnmappedCount] = useState(0);
+  const [mappingValidated, setMappingValidated] = useState(false);
+
   const [activeReport, setActiveReport] = useState<'pl' | 'bs' | 'cf'>('pl');
   const [reportView, setReportView] = useState<ReportView>('Schedule III');
   const [selectedPeriod, setSelectedPeriod] = useState(0); // 0 = historical, 1-5 = forecast years
+
+  // Validate that all accounts are mapped
+  useEffect(() => {
+    if (ledgerEntries.length === 0) {
+      setMappingValidated(true);
+      setUnmappedCount(0);
+      return;
+    }
+
+    // Check if all ledger entries have mappings
+    const savedRules = loadSavedRules();
+    let unmapped = 0;
+
+    for (const entry of ledgerEntries) {
+      const result = mapLedgerToUFS(entry.ledger_name, savedRules);
+      const hasMapping = ledgerMappings.some(m => m.ledger_name === entry.ledger_name);
+      if (!result.ufsAccount || result.confidence < 50) {
+        if (!hasMapping) {
+          unmapped++;
+        }
+      }
+    }
+
+    setUnmappedCount(unmapped);
+    setMappingValidated(unmapped === 0);
+  }, [ledgerEntries, ledgerMappings]);
 
   useEffect(() => {
     if (currentProject) {
@@ -293,7 +329,29 @@ export function Reports({}: ReportsProps) {
         </div>
       )}
 
-      {hasData && (
+      {hasData && !mappingValidated && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-6">
+          <div className="flex items-start gap-4">
+            <AlertTriangle className="w-8 h-8 text-red-500 flex-shrink-0" />
+            <div className="flex-1">
+              <h3 className="text-lg font-semibold text-red-900 mb-2">Complete Account Mapping before generating financial statements</h3>
+              <p className="text-red-700 mb-4">
+                {unmappedCount} accounts need to be mapped to standard financial statement line items.
+                Reports cannot be generated until all accounts are properly mapped.
+              </p>
+              <button
+                onClick={() => navigate('/upload')}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
+              >
+                <Settings2 className="w-4 h-4" />
+                Go to Account Mapping
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hasData && mappingValidated && (
         <>
           {/* Controls */}
           <div className="flex flex-wrap items-center gap-4 bg-white p-4 rounded-xl border border-slate-200">
