@@ -43,7 +43,8 @@ import {
 } from 'lucide-react';
 
 interface UploadDataProps {
-  onComplete: () => void;
+  onComplete: (importType?: 'statements' | 'ledger' | null) => void;
+  onImportTypeDetected?: (type: 'statements' | 'ledger' | null) => void;
 }
 
 type ProcessingStage =
@@ -89,7 +90,9 @@ const STAGE_LABELS: Record<ProcessingStage, string> = {
 
 const PROCESSING_TIMEOUT = 60000; // 60 seconds max
 
-export function UploadData({ onComplete }: UploadDataProps) {
+type ImportType = 'statements' | 'ledger' | null;
+
+export function UploadData({ onComplete, onImportTypeDetected }: UploadDataProps) {
   const {
     addLedgerEntries,
     ledgerEntries,
@@ -125,6 +128,9 @@ export function UploadData({ onComplete }: UploadDataProps) {
   const [mappedAccounts, setMappedAccounts] = useState<MappingResult[]>([]);
   const [unmappedAccounts, setUnmappedAccounts] = useState<MappingResult[]>([]);
   const [mappingSearch, setMappingSearch] = useState('');
+
+  // Import type detection
+  const [importType, setImportType] = useState<ImportType>(null);
 
   // Timeout ref
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -252,10 +258,25 @@ export function UploadData({ onComplete }: UploadDataProps) {
       setParsedData(result.data);
       setExtendedResult(result);
 
+      // Detect import type based on what was parsed
+      const hasFinancialStatements = result.statements && result.statements.length > 0;
+      const hasLedgerData = result.data.length > 0;
+
+      let detectedImportType: ImportType = null;
+      if (hasFinancialStatements) {
+        detectedImportType = 'statements';
+        console.log('[UploadData] Detected: Published Financial Statements');
+      } else if (hasLedgerData) {
+        detectedImportType = 'ledger';
+        console.log('[UploadData] Detected: Ledger Import');
+      }
+      setImportType(detectedImportType);
+      onImportTypeDetected?.(detectedImportType);
+
       // Store financial statements in the store if found
-      if (result.statements && result.statements.length > 0) {
-        console.log('[UploadData] Setting financial statements:', result.statements.length);
-        setFinancialStatements(result.statements);
+      if (hasFinancialStatements) {
+        console.log('[UploadData] Setting financial statements:', result.statements!.length);
+        setFinancialStatements(result.statements!);
       }
 
       if (result.parseReport) {
@@ -263,8 +284,8 @@ export function UploadData({ onComplete }: UploadDataProps) {
         setParseReport(result.parseReport);
       }
 
-      // Stage 4: Mapping (for trial balance or ledger data)
-      if (result.data.length > 0) {
+      // Stage 4: Mapping (ONLY for ledger data, NOT for financial statements)
+      if (hasLedgerData && !hasFinancialStatements) {
         updateStage('mapping', 60);
 
         const entries: LedgerEntry[] = result.data.map((row) => ({
@@ -344,8 +365,40 @@ export function UploadData({ onComplete }: UploadDataProps) {
   // Handle import submission
   const handleSubmit = async () => {
     console.log('[handleSubmit] Starting import...');
+    console.log('[handleSubmit] Import type:', importType);
 
-    // Check for unmapped accounts
+    // For financial statements, skip unmapped check
+    if (importType === 'statements') {
+      console.log('[handleSubmit] Financial statements import - skipping mapping');
+      setIsProcessing(true);
+      setLoading(true);
+      updateStage('generating', 0);
+
+      try {
+        if (extendedResult?.statements && extendedResult.statements.length > 0 && extendedResult.parseReport) {
+          console.log('[handleSubmit] Saving financial statements...');
+          updateStage('generating', 50);
+          await saveFinancialStatements(extendedResult.statements, extendedResult.parseReport);
+          console.log('[handleSubmit] Financial statements saved');
+        }
+
+        updateStage('completed', 100);
+        console.log('[handleSubmit] Import complete');
+        setCurrentStep('complete');
+
+      } catch (err) {
+        console.error('[handleSubmit] Error:', err);
+        const errorMessage = err instanceof Error ? err.message : 'Import failed';
+        setError(errorMessage);
+        updateStage('error', 0, errorMessage);
+      } finally {
+        setIsProcessing(false);
+        setLoading(false);
+      }
+      return;
+    }
+
+    // For ledger imports, check for unmapped accounts
     if (unmappedAccounts.length > 0) {
       console.log('[handleSubmit] Unmapped accounts exist, showing mapping step');
       setCurrentStep('mapping');
@@ -646,24 +699,59 @@ export function UploadData({ onComplete }: UploadDataProps) {
         </div>
       )}
 
-      {/* Mapping Summary */}
-      <div className="grid grid-cols-3 gap-4">
-        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
-          <p className="text-sm text-emerald-700">Mapped Accounts</p>
-          <p className="text-2xl font-bold text-emerald-900">{mappedAccounts.length}</p>
+      {/* Import Type Detection */}
+      {importType && (
+        <div className={`p-4 rounded-xl border ${
+          importType === 'statements'
+            ? 'bg-blue-50 border-blue-200'
+            : 'bg-emerald-50 border-emerald-200'
+        }`}>
+          <div className="flex items-center gap-3">
+            {importType === 'statements' ? (
+              <>
+                <FileText className="w-5 h-5 text-blue-600" />
+                <div>
+                  <p className="font-medium text-blue-900">Published Financial Statements Detected</p>
+                  <p className="text-sm text-blue-700">
+                    Account Mapping is not required for financial statements.
+                  </p>
+                </div>
+              </>
+            ) : (
+              <>
+                <Table className="w-5 h-5 text-emerald-600" />
+                <div>
+                  <p className="font-medium text-emerald-900">Ledger Import Detected</p>
+                  <p className="text-sm text-emerald-700">
+                    Account Mapping will be required before generating reports.
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
         </div>
-        <div className={`border rounded-xl p-4 ${unmappedAccounts.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-emerald-50 border-emerald-200'}`}>
-          <p className={`text-sm ${unmappedAccounts.length > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>Unmapped Accounts</p>
-          <p className={`text-2xl font-bold ${unmappedAccounts.length > 0 ? 'text-amber-900' : 'text-emerald-900'}`}>{unmappedAccounts.length}</p>
-        </div>
-        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
-          <p className="text-sm text-blue-700">Total Ledger Entries</p>
-          <p className="text-2xl font-bold text-blue-900">{parsedData.length}</p>
-        </div>
-      </div>
+      )}
 
-      {/* Warning for unmapped accounts */}
-      {unmappedAccounts.length > 0 && (
+      {/* Mapping Summary - ONLY show for ledger imports */}
+      {importType === 'ledger' && (
+        <div className="grid grid-cols-3 gap-4">
+          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+            <p className="text-sm text-emerald-700">Mapped Accounts</p>
+            <p className="text-2xl font-bold text-emerald-900">{mappedAccounts.length}</p>
+          </div>
+          <div className={`border rounded-xl p-4 ${unmappedAccounts.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-emerald-50 border-emerald-200'}`}>
+            <p className={`text-sm ${unmappedAccounts.length > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>Unmapped Accounts</p>
+            <p className={`text-2xl font-bold ${unmappedAccounts.length > 0 ? 'text-amber-900' : 'text-emerald-900'}`}>{unmappedAccounts.length}</p>
+          </div>
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+            <p className="text-sm text-blue-700">Total Ledger Entries</p>
+            <p className="text-2xl font-bold text-blue-900">{parsedData.length}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Warning for unmapped accounts - ONLY for ledger imports */}
+      {importType === 'ledger' && unmappedAccounts.length > 0 && (
         <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl">
           <div className="flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
@@ -818,7 +906,11 @@ export function UploadData({ onComplete }: UploadDataProps) {
       </div>
       <h2 className="text-2xl font-bold text-slate-900 mb-2">Import Complete</h2>
       <p className="text-slate-600 mb-6">
-        Successfully imported {extendedResult?.statements?.length || 0} statements and {parsedData.length} ledger entries
+        {importType === 'statements' ? (
+          <>Successfully imported {extendedResult?.statements?.length || 0} financial statements</>
+        ) : (
+          <>Successfully imported {parsedData.length} ledger entries</>
+        )}
       </p>
       <div className="flex justify-center gap-4">
         <button
@@ -828,10 +920,10 @@ export function UploadData({ onComplete }: UploadDataProps) {
           Import More Data
         </button>
         <button
-          onClick={onComplete}
+          onClick={() => onComplete(importType)}
           className="px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 transition-colors"
         >
-          Continue to Dashboard
+          {importType === 'statements' ? 'Continue to Assumptions' : 'Continue to Account Mapping'}
         </button>
       </div>
     </div>
@@ -1032,6 +1124,10 @@ export function UploadData({ onComplete }: UploadDataProps) {
 
       setParsedData(sampleLedgerEntries);
       setSelectedType('trial_balance');
+
+      // Set import type for ledger data
+      setImportType('ledger');
+      onImportTypeDetected?.('ledger');
 
       updateStage('mapping', 50);
       const entries: LedgerEntry[] = sampleLedgerEntries.map((row) => ({
